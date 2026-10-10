@@ -1,0 +1,681 @@
+---
+title: "Asset Pricing and Risk Analysis in R"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+    html_preview: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  comment = "#>", fig.path = "figures/",
+  fig.width = 7, fig.height = 4.5, dpi = 120
+)
+```
+
+## Overview
+
+This project covers the main building blocks of quantitative asset pricing and financial risk management, implemented from scratch in R:
+
+1. **Svensson yield curve** and bond pricing, with calibration of the curve on market prices.
+2. **Option pricing**: Monte Carlo (Euler and exact distribution), binomial tree and Black-Scholes-Merton.
+3. **Greeks and delta-hedging** of an option portfolio.
+4. **PCA on interest rates** and factor-based Value at Risk.
+5. **Historical vs parametric VaR and Expected Shortfall** for an equity portfolio.
+6. **Merton structural model** of credit risk.
+7. **Gaussian vs t copulas** and joint default probabilities.
+8. **IRB calibration of a retail credit portfolio** (PD, LGD, EAD, Basel/Vasicek capital and a Monte Carlo credit portfolio model) on real peer-to-peer loan data.
+
+```{r packages}
+library(mvtnorm)    # Multivariate normal and t distributions 
+library(esquisse)   # Help to plot    
+library(moments)    # Skewness and kurtosis
+library(tidyverse)  # Data manipulation 
+library(lubridate)  # Dates
+
+data_dir <- "data"  # folder with the input CSV files (see data/README.md)
+```
+
+## Part 1: Svensson yield curve and bond pricing
+
+The Svensson (SNS) model describes the spot and the forward curve with six parameters: the level `b0`, the slope `b1`, two curvature terms `b2` and `b3` and two decay factors `tau1` and `tau2`. The parameters below are those of the curve "published today", which was used to generate the market prices of the bonds.
+
+```{r svensson-functions}
+SNS_spot_rate <- function(t, b0, b1, b2, b3, tau1, tau2) {
+  A1 <- ifelse(t == 0, 1, (1 - exp(-t/tau1)) / (t/tau1))
+  A2 <- ifelse(t == 0, 1, (1 - exp(-t/tau2)) / (t/tau2))
+  b0 + b1*A1 + b2*(A1 - exp(-t/tau1)) + b3*(A2 - exp(-t/tau2))
+}
+
+SNS_fwd_rate <- function(t, b0, b1, b2, b3, tau1, tau2) {
+  b0 + b1*exp(-t/tau1) + b2*(t/tau1)*exp(-t/tau1) + b3*(t/tau2)*exp(-t/tau2)
+}
+
+# Parameters of the curve "published today" (used to generate market_price)
+b0 <- 3.0
+b1 <- -1.8
+b2 <- 1.0
+b3 <- -1.5
+tau1 <- 1.5
+tau2 <- 7
+
+bonds_df <- read.csv(file.path(data_dir, "obbligazioni_portafoglio.csv"))
+str(bonds_df)
+head(bonds_df)
+```
+
+### Spot and forward curves
+
+```{r spot-forward-curves}
+tgrid <- seq(0, 20, by = 0.1)
+z   <- SNS_spot_rate(tgrid, b0, b1, b2, b3, tau1, tau2)
+fws <- SNS_fwd_rate(tgrid, b0, b1, b2, b3, tau1, tau2)
+
+plot(tgrid, z, type = "l", main = "Yield curve (Svensson)",
+     xlab = "Maturity (years)", ylab = "Rate (%)", ylim = range(z, fws))
+lines(tgrid, fws, col = "red")
+legend("bottomright", legend = c("Spot", "Forward"), col = c("black", "red"), lty = 1)
+```
+
+### Pricing a 5-year bond with the spot curve
+
+Each cash flow is discounted with the spot rate of its maturity (continuous compounding).
+
+```{r bond-pricing}
+bonds5y <- bonds_df[bonds_df$bond_id == "BOND_5Y", ]
+cf <- bonds5y$cashflow
+t_bond5y <- bonds5y$time_years
+z_bond5y <- SNS_spot_rate(t_bond5y, b0, b1, b2, b3, tau1, tau2) / 100
+
+price_bond <- sum(cf * exp(-z_bond5y * t_bond5y))
+cat("Model price of BOND_5Y:", round(price_bond, 4))
+cat("Market price of BOND_5Y:", unique(bonds5y$market_price))
+```
+
+### Yield to maturity
+
+The yield to maturity is the single rate that reproduces the price of the bond. It is found numerically.
+
+```{r ytm}
+price_from_y <- function(y) sum(cf * exp(-y * t_bond5y))
+ytm_bond <- uniroot(function(y) price_from_y(y) - price_bond, c(-0.1, 0.5))$root
+cat("YTM:", round(ytm_bond * 100, 4), "%\n")
+```
+
+### Calibration of the curve on all the bonds
+
+The six parameters are re-estimated starting from a different point, by minimising the sum of squared differences between model and market prices.
+
+```{r calibration}
+start_par <- c(3.6, -1.44, 1.3, -1.05, 1.95, 5.6)
+
+bond_ids <- unique(bonds_df$bond_id)
+bonds <- lapply(bond_ids, function(id) {
+  sub <- bonds_df[bonds_df$bond_id == id, ]
+  list(cf = sub$cashflow, t = sub$time_years)
+})
+mkt_price <- sapply(bond_ids, function(id) unique(bonds_df$market_price[bonds_df$bond_id == id]))
+
+bond_price_sns <- function(cf, t, par) {
+  zz <- SNS_spot_rate(t, par[1], par[2], par[3], par[4], par[5], par[6]) / 100
+  sum(cf * exp(-zz * t))
+}
+obj_fun <- function(par, bonds, mkt_price) {
+  model_price <- sapply(bonds, function(b) bond_price_sns(b$cf, b$t, par))
+  sum((model_price - mkt_price)^2)
+}
+ret <- optim(par = start_par, fn = obj_fun, bonds = bonds, mkt_price = mkt_price,
+             method = "Nelder-Mead", control = list(maxit = 5000, reltol = 1e-12))
+
+cat("Final objective error:", format(ret$value, scientific = TRUE))
+cat("Estimated parameters:", round(ret$par, 4))
+cat("'True' parameters:   ", c(b0, b1, b2, b3, tau1, tau2))
+```
+
+```{r calibration-plot}
+z_est <- SNS_spot_rate(tgrid, ret$par[1], ret$par[2], ret$par[3], ret$par[4], ret$par[5], ret$par[6])
+gap_bp <- abs(z - z_est) * 100   # gap between the curves, in basis points
+
+cat("Maximum gap between estimated and true curve (bp):", round(max(gap_bp), 2))
+
+plot(tgrid, z, type = "l", main = "True vs calibrated curve",
+     xlab = "Maturity (years)", ylab = "Rate (%)")
+lines(tgrid, z_est, col = "red", lty = 2)
+legend("bottomright", legend = c("True", "Calibrated"), col = c("black", "red"), lty = c(1, 2))
+```
+
+The calibration finds the parameters that minimise the squared bond price errors. The final error is on the order of 1e-8, practically zero. Even though the estimated parameters differ from the true ones, the curve fits almost perfectly: the deviation is at most about 0.2 bp within the bond maturities (up to 8 years) and grows to about 2.9 bp at 20 years, where there are no bonds and the curve is only extrapolated.
+
+## Part 2: Option pricing (Monte Carlo, binomial tree, Black-Scholes-Merton)
+
+A European call (S0 = 50, strike K = 52, maturity 1 year, risk-free rate 3%, volatility 25%) is priced with four methods and the results are compared.
+
+```{r option-setup}
+set.seed(256)
+S0 <- 50
+K <- 52
+Tt <- 1
+r <- 0.03
+sigma <- 0.25
+n <- 20000                           # Number of Monte Carlo scenarios
+dt <- 1 / 100                        # time step
+steps <- Tt / dt
+```
+
+### Monte Carlo with Euler discretisation
+
+```{r mc-euler}
+start.time <- Sys.time()
+eps <- matrix(rnorm(steps * n), steps, n)
+S_t <- array(0, c(steps + 1, n))
+S_t[1, ] <- S0
+for (i in 1:steps) {
+  S_t[i + 1, ] <- S_t[i, ] + S_t[i, ] * (r * dt + sigma * sqrt(dt) * eps[i, ])
+}
+payoff <- pmax(S_t[steps + 1, ] - K, 0)
+c_0 <- mean(payoff) * exp(-r * Tt)
+time1 <- as.numeric(Sys.time() - start.time, units = "secs")
+mc_se <- sd(payoff) * exp(-r * Tt) / sqrt(n)   # Monte Carlo standard error
+c_0
+
+matplot(S_t[, 1:100], type = "l", xlab = "Step", ylab = "S", main = "First 100 paths")
+```
+
+### Monte Carlo with the exact distribution of the terminal price
+
+Since the terminal price of a geometric Brownian motion is log-normal, there is no need to simulate the whole path.
+
+```{r mc-exact}
+start.time <- Sys.time()
+eps2 <- rnorm(n = n)
+S2_t <- S0 * exp((r - sigma^2/2) * Tt + sigma * sqrt(Tt) * eps2)
+hist(S2_t, main = "Simulated terminal prices", xlab = "S_T")
+payoff2 <- pmax(S2_t - K, 0)
+hist(payoff2, main = "Simulated payoffs", xlab = "Payoff")
+c_0_2 <- mean(payoff2) * exp(-r * Tt)
+time2 <- as.numeric(Sys.time() - start.time, units = "secs")
+c_0_2
+```
+
+### Cox-Ross-Rubinstein binomial tree
+
+```{r binomial-tree}
+start.time <- Sys.time()
+u <- exp(sigma * sqrt(dt))
+d <- exp(-sigma * sqrt(dt))
+q <- (exp(r * dt) - d) / (u - d)
+j <- 0:steps
+ST_tree <- S0 * u^(steps - j) * d^j
+payoff_tree <- pmax(ST_tree - K, 0)
+probs <- dbinom(j, steps, q)
+c_0_tree <- sum(payoff_tree * probs) * exp(-r * Tt)
+time3 <- as.numeric(Sys.time() - start.time, units = "secs")
+c_0_tree
+```
+
+### Black-Scholes-Merton closed formula
+
+```{r bsm}
+call_BSM <- function(S, K, r, t, sigma) {
+  d1 <- (log(S/K) + (r + sigma^2/2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  S * pnorm(d1) - K * exp(-r * t) * pnorm(d2)
+}
+start.time <- Sys.time()
+c_0_bsm <- call_BSM(S0, K, r, Tt, sigma)
+time4 <- as.numeric(Sys.time() - start.time, units = "secs")
+c_0_bsm
+```
+
+### Comparison of the methods
+
+```{r option-comparison}
+call_prices <- data.frame(
+  method   = c("MC (Euler)", "MC (exact distribution)", "Binomial tree", "BSM"),
+  price    = round(c(c_0, c_0_2, c_0_tree, c_0_bsm), 4),
+  time_sec = signif(c(time1, time2, time3, time4), 3)
+)
+knitr::kable(call_prices)
+```
+
+With 20 thousand scenarios the differences between the four prices are small: the Monte Carlo standard error is about 0.06, so the differences between the Monte Carlo prices and the closed formula can be classified as sampling noise and not as a systematic error. For the tree, the error of about +0.07 with respect to the closed formula can be classified as discretisation error and not as noise.
+
+## Part 3: Greeks and delta-hedging
+
+The portfolio is a long call with strike K2 = 52 and a long put with strike K1 = 48 (a long strangle), with S0 = 50, maturity of 6 months, risk-free rate 3% and volatility 22%.
+
+```{r greeks-setup}
+S0 <- 50
+K1 <- 48
+K2 <- 52
+r <- 0.03
+Tt <- 0.5
+sigma <- 0.22
+w <- c(1, 1)   # 1 long call on K2 + 1 long put on K1
+
+put_BSM <- function(S, K, r, t, sigma) {
+  d1 <- (log(S/K) + (r + sigma^2/2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  K * exp(-r * t) * pnorm(-d2) - S * pnorm(-d1)
+}
+delta_c <- function(S, K, r, t, sigma) {
+  d1 <- (log(S/K) + (r + sigma^2/2) * t) / (sigma * sqrt(t))
+  pnorm(d1)
+}
+delta_p <- function(S, K, r, t, sigma) {
+  d1 <- (log(S/K) + (r + sigma^2/2) * t) / (sigma * sqrt(t))
+  pnorm(d1) - 1
+}
+gamma_BSM <- function(S, K, r, t, sigma) {
+  d1 <- (log(S/K) + (r + sigma^2/2) * t) / (sigma * sqrt(t))
+  dnorm(d1) / (S * sigma * sqrt(t))
+}
+vega_BSM <- function(S, K, r, t, sigma) {
+  d1 <- (log(S/K) + (r + sigma^2/2) * t) / (sigma * sqrt(t))
+  S * sqrt(t) * dnorm(d1)
+}
+```
+
+### Portfolio Delta and Gamma
+
+```{r greeks-portfolio}
+delta_pi <- w[1] * delta_c(S0, K2, r, Tt, sigma) + w[2] * delta_p(S0, K1, r, Tt, sigma)
+gamma_pi <- w[1] * gamma_BSM(S0, K2, r, Tt, sigma) + w[2] * gamma_BSM(S0, K1, r, Tt, sigma)
+cat("Portfolio Delta:", round(delta_pi, 4))
+cat("Portfolio Gamma:", round(gamma_pi, 4))
+```
+
+### Check with finite differences
+
+```{r greeks-finite-differences}
+h <- 0.01
+V <- function(S) w[1] * call_BSM(S, K2, r, Tt, sigma) + w[2] * put_BSM(S, K1, r, Tt, sigma)
+delta_fd <- (V(S0 + h) - V(S0 - h)) / (2 * h)
+gamma_fd <- (V(S0 + h) - 2 * V(S0) + V(S0 - h)) / h^2
+cat("Delta (finite differences):", round(delta_fd, 4))
+cat("Gamma (finite differences):", round(gamma_fd, 4))
+```
+
+### Delta-hedge
+
+```{r delta-hedge}
+w_h <- c(w, -delta_pi)  
+delta_h <- w_h[1] * delta_c(S0, K2, r, Tt, sigma) + w_h[2] * delta_p(S0, K1, r, Tt, sigma) + w_h[3] * 1
+cat("Delta after hedge:", round(delta_h, 6))   #Gamma stays unchanged as should
+```
+
+Delta is equal to 0.138, so if the underlying increases by 1 euro the portfolio gains about 0.14 euros. Gamma is strictly positive (0.0978) because the portfolio is long options, so it benefits most from large movements in either direction. Delta-hedging is done by selling 0.138 shares of the underlying, which brings Delta to zero. However, the hedge only holds instantaneously: since Gamma is not zero, Delta changes as the underlying moves, so frequent rebalancing is required.
+
+## Part 4: PCA on interest rates and factor-based VaR
+
+```{r pca-data}
+curva <- read.csv(file.path(data_dir, "curva_tassi_storico.csv"))
+mat <- c(1, 2, 3, 5, 7, 10, 20, 30)
+
+# Daily changes of the rates, in basis points
+rate_changes <- apply(curva[, -1], 2, diff) * 100
+```
+
+### Covariance matrix and principal components
+
+```{r pca}
+cov_mat <- cov(rate_changes)
+image(cov_mat, main = "Covariance matrix")
+pca <- eigen(cov_mat)
+
+# Share of variance explained by each component, and cumulative share
+share_var   <- pca$values / sum(pca$values) * 100
+explain_var <- cumsum(share_var)
+round(explain_var, 2)
+```
+
+### Factor loadings
+
+```{r loadings}
+round(pca$vectors[, 1:3], 3)
+matplot(mat, pca$vectors[, 1:3], type = "l", lty = 1, col = c("black", "red", "blue"),
+        xlab = "Maturity (years)", ylab = "Loading", main = "Factor loadings")
+legend("bottomright", legend = c("PC1", "PC2", "PC3"), col = c("black", "red", "blue"), lty = 1)
+```
+
+### 99% VaR with two factors vs the full covariance matrix
+
+`sens` contains the sensitivities of the portfolio to the eight rates (one per maturity). The VaR is computed in two ways: projecting the sensitivities on the first two principal components, and using the full covariance matrix.
+
+```{r var-pca}
+sens <- c(0, 8, 3, -6, -5, 2, 1, 0)
+s1 <- sum(sens * pca$vectors[, 1])
+s2 <- sum(sens * pca$vectors[, 2])
+sd_p <- sqrt(s1^2 * pca$values[1] + s2^2 * pca$values[2])
+VaR99_pca <- sd_p * qnorm(0.99)
+VaR99_full <- sqrt(as.numeric(t(sens) %*% cov_mat %*% sens)) * qnorm(0.99)
+cat("99% VaR with only 2 factors:", round(VaR99_pca, 3))
+cat("99% VaR with full covariance:", round(VaR99_full, 3))
+```
+
+PC1 and PC2 together explain 98.9% of the total variance (82.4% and 16.5% respectively), so the other components can be classified as "noise": PC3 explains only 0.3%. The 99% VaR is 64.19 with only two components and 69.9 with all the components: the comparison shows that the two-factor approximation underestimates the risk.
+
+## Part 5: Value at Risk and Expected Shortfall (historical and parametric)
+
+A portfolio of four equity indices is invested with amounts of 4,000, 3,000, 1,000 and 2,000 (thousand euros, 10 million in total). The 99% one-day VaR and the Expected Shortfall (CVaR) are computed with historical simulation and with a Gaussian parametric model.
+
+```{r var-data}
+index <- read.csv(file.path(data_dir, "indici_azionari_storico.csv"))
+assets <- c("Eq_A", "Eq_B", "Eq_C", "Eq_D")
+invest <- c(4000, 3000, 1000, 2000)
+alpha <- 0.99
+
+# Simple returns
+P <- as.matrix(index[, assets])
+rets <- P[-1, ] / P[-nrow(P), ] - 1
+```
+
+### Historical simulation
+
+```{r var-historical}
+pnl_hist <- rets %*% invest
+loss_hist <- -pnl_hist
+VaR_hist <- quantile(loss_hist, alpha)
+CVaR_hist <- mean(loss_hist[loss_hist >= VaR_hist])
+cat("Historical VaR 99%:", round(VaR_hist, 1))
+cat("Historical CVaR 99%:", round(CVaR_hist, 1))
+```
+
+### Parametric (Gaussian) model
+
+```{r var-parametric}
+mu_hat <- colMeans(rets)
+sigma_hat <- cov(rets)
+mu_p <- sum(invest * mu_hat)
+sd_p2 <- as.numeric(sqrt(t(invest) %*% sigma_hat %*% invest))
+VaR_par <- -mu_p + sd_p2 * qnorm(alpha)
+CVaR_par <- -mu_p + sd_p2 * dnorm(qnorm(alpha)) / (1 - alpha)
+cat("Parametric VaR 99%:", round(VaR_par, 1))
+cat("Parametric CVaR 99%:", round(CVaR_par, 1))
+```
+
+### Comparison and shape of the loss distribution
+
+```{r var-comparison}
+x <- as.numeric(loss_hist)
+excess_kurtosis <- kurtosis(x) - 3   # shifted so that a Gaussian has 0
+cat("Skewness:", round(skewness(x), 3))
+cat("Excess kurtosis:", round(excess_kurtosis, 3))
+```
+
+In one day, with 99% probability, the loss does not exceed about 175-180 thousand euros (about 1.75% of the 10 million portfolio). The CVaR (the mean loss in the worst 1% of cases) is about 195-206 thousand euros, i.e. roughly 1.95%-2.06% of the portfolio.
+
+The two approaches give similar results because the returns of this dataset are almost Gaussian (see the skewness and excess kurtosis above), so the assumption of the parametric model holds. The small residual difference comes from sampling noise: historical VaR and CVaR are noisy estimates. With fat-tailed data, the parametric approach would underestimate the tail.
+
+## Part 6: Credit risk, Merton model
+
+```{r merton}
+firms <- read.csv(file.path(data_dir, "firms_merton.csv"))
+
+# d1 and d2
+d1_cred <- (log(firms$V0 / firms$F_debt) + (firms$r + firms$sigma_V^2/2) * firms$T_mat) /
+  (firms$sigma_V * sqrt(firms$T_mat))
+d2_cred <- d1_cred - firms$sigma_V * sqrt(firms$T_mat)
+
+# Equity as a call option on the value of the assets
+E0 <- firms$V0 * pnorm(d1_cred) - firms$F_debt * exp(-firms$r * firms$T_mat) * pnorm(d2_cred)
+
+# Risky debt, and check of the identity E0 + D0 = V0
+D0 <- firms$V0 - E0
+cat("E0 + D0 = V0 for all issuers:", isTRUE(all.equal(E0 + D0, firms$V0)))
+
+# Annualised credit spread
+spread <- -(1 / firms$T_mat) * log(D0 / firms$F_debt) - firms$r
+merton_tab <- data.frame(
+  firm_id    = firms$firm_id,
+  E0         = round(E0, 4),
+  D0         = round(D0, 4),
+  spread_pct = round(spread * 100, 4)
+)
+merton_tab <- merton_tab[order(-merton_tab$spread_pct), ]
+```
+
+Credit risk by issuer, in descending order of spread:
+
+```{r merton-table}
+knitr::kable(merton_tab, row.names = FALSE)
+cat("Issuer closest to default:", as.character(merton_tab$firm_id[1]))
+```
+
+In the Merton model, the equity is a call on the value of the assets with a strike equal to the debt. The risky debt is worth the discounted face value minus a put sold to the shareholders. The spread is the extra yield required for bearing this risk, and it grows with leverage and asset volatility.
+
+The equity of Firm_E is worth more than that of Firm_C even though Firm_E is the riskier issuer: higher volatility increases the value of the option (the equity) and decreases the value of the debt. The (risk-neutral) default probabilities are very high because leverage and volatility are also high.
+
+## Part 7: Credit risk, copulas (Gaussian vs Student's t)
+
+Two obligors with a 3% default probability and an asset correlation of 0.25 are simulated with a Gaussian copula and with a t copula (4 degrees of freedom). The marginal default probabilities are the same; what changes is the dependence in the tails.
+
+```{r copulas}
+set.seed(2026)
+n <- 50000
+rho <- 0.25
+PD <- 0.03
+nu <- 4                                # degrees of freedom
+Rc <- matrix(c(1, rho, rho, 1), 2, 2)
+
+# Gaussian copula
+Z <- rmvnorm(n, sigma = Rc)
+U_gauss <- pnorm(Z)
+
+# t copula
+Xt <- rmvt(n, sigma = Rc, df = nu)
+U_t <- pt(Xt, df = nu)
+
+# Marginal default probability (should be close to PD for both copulas)
+cat("P(default_1), Gaussian copula:", round(mean(U_gauss[, 1] < PD), 4))
+cat("P(default_1), t copula:       ", round(mean(U_t[, 1] < PD), 4))
+cat("Expected:                     ", PD, "\n")
+
+# Joint default probability
+pd_joint_gauss <- mean(U_gauss[, 1] < PD & U_gauss[, 2] < PD)
+pd_joint_t <- mean(U_t[, 1] < PD & U_t[, 2] < PD)
+cat("P(joint default), Gaussian copula:", round(pd_joint_gauss, 4))
+cat("P(joint default), t copula:       ", round(pd_joint_t, 4))
+cat("Ratio t / Gaussian:               ", round(pd_joint_t / pd_joint_gauss, 2))
+```
+
+The joint probability of default is 0.0030 with the Gaussian copula and 0.0062 with the t copula, approximately 2.1 times as high. If the events were independent, it would be 0.0009. The ratio shows how many times the Gaussian copula underestimates the joint default probability: simultaneous defaults are much more likely with the t copula. This is the effect that Gaussian models underestimated in the 2008 crisis.
+
+## Part 8: Credit risk models and IRB calibration for a retail portfolio
+
+The last part uses real loan-level data from a peer-to-peer lending platform (Prosper). Historical loans are used to calibrate the probability of default (PD) by rating class and the severity (LGD), and more recent loans are treated as the "live" portfolio on which the Expected Loss, the Unexpected Loss and the regulatory capital are computed.
+
+```{r irb-data}
+set.seed(42)   # For reproducibility
+
+# Rating order (from best to worst)
+rat <- c("AA", "A", "B", "C", "D", "E", "HR")
+
+loans <- read_csv(file.path(data_dir, "prosper_loans_credit.csv"), show_col_types = FALSE) %>%
+  # Remove duplicate rows
+  distinct(ListingKey, .keep_all = TRUE) %>%
+  filter(!is.na(ProsperRating_Alpha), ProsperRating_Alpha != "") %>%
+  mutate(
+    rating  = factor(ProsperRating_Alpha, levels = rat),
+    orig    = ymd(str_sub(LoanOriginationDate, 1, 10)),
+    closed  = ymd(str_sub(ClosedDate, 1, 10)),
+    years   = as.numeric(closed - orig) / 365.25,
+    # General default status
+    default = LoanStatus %in% c("Defaulted", "Chargedoff")
+  )
+
+# Keep only loans that are "old" enough to define a 1-year default
+sample12 <- loans %>%
+  filter(orig <= ymd("2013-03-10")) %>%
+  mutate(default12 = default & years <= 1)
+
+# Train/test split by date: the historical data (train) calibrate PD and LGD,
+# the more recent data (test) are the "live portfolio" used to compute the required capital.
+train <- sample12 %>% filter(orig <= ymd("2012-03-31"))
+test  <- sample12 %>% filter(orig >  ymd("2012-03-31"))
+
+cat("Train data:", nrow(train), "\n")
+cat("Test data (live portfolio):", nrow(test))
+```
+
+### Components of credit risk: EAD, PD and severity (LGD)
+
+```{r irb-parameters}
+# Historical defaults, used to compute the severity and the EAD fraction
+dflt <- train %>% filter(default12, LP_GrossPrincipalLoss > 0) %>%
+  mutate(sev = pmin(pmax(LP_NetPrincipalLoss / LP_GrossPrincipalLoss, 0), 1))
+
+# EAD fraction: average portion of the loan still outstanding at the time of default
+EAD_frac <- mean(dflt$LP_GrossPrincipalLoss / dflt$LoanOriginalAmount, na.rm = TRUE)
+
+# Calibration of the PD by rating and of the average severity
+params <- train %>%
+  group_by(rating) %>%
+  summarise(
+    n_loans = n(),
+    PD = mean(default12),   # empirical probability of default
+    .groups = "drop"
+  ) %>%
+  left_join(dflt %>% group_by(rating) %>% summarise(SEV = mean(sev)), by = "rating") %>%
+  # If a rating class has no historical defaults, use the global mean severity
+  mutate(SEV = coalesce(SEV, mean(dflt$sev, na.rm = TRUE)))
+
+params %>%
+  mutate(PD_pct = round(PD * 100, 2), SEV_pct = round(SEV * 100, 2)) %>%
+  knitr::kable()
+```
+
+### Expected and Unexpected Loss (binomial model, independent loans)
+
+The calibrated parameters are applied to the live portfolio. The basic binomial formula assumes independence between loans: the standard deviation of the loss of a single loan is `EAD * SEV * sqrt(PD * (1 - PD))`, and the variance of the portfolio is the sum of the individual variances.
+
+```{r irb-binomial}
+test_port <- test %>%
+  left_join(params, by = "rating") %>%
+  mutate(
+    EAD = LoanOriginalAmount * EAD_frac,   # original amount * typical outstanding fraction
+    EL  = EAD * PD * SEV,
+    UL_ind = EAD * SEV * sqrt(PD * (1 - PD))   # stand-alone UL (binomial)
+  )
+
+EAD_tot <- sum(test_port$EAD)
+EL_tot  <- sum(test_port$EL)
+UL_portfolio_ind <- sqrt(sum(test_port$UL_ind^2))
+
+cat("EAD total:", round(EAD_tot / 1e6, 2), "million")
+cat("EL total:", round(EL_tot / 1e6, 2), "million")
+cat("UL portfolio (independent loans):", round(UL_portfolio_ind / 1e6, 2), "million")
+```
+
+### Default correlation and the Vasicek model (Basel IRB approach)
+
+The correlation comes from the official Basel formula for retail exposures. The Vasicek model gives the Worst Case Default Rate (WCDR) at the 99.9% confidence level for each rating class, which is then turned into a VaR and a capital requirement.
+
+```{r irb-vasicek}
+basel_rho <- function(pd) {
+  0.03 * ((1 - exp(-35 * pd)) / (1 - exp(-35))) + 0.16 * (1 - ((1 - exp(-35 * pd)) / (1 - exp(-35))))
+}
+
+params <- params %>%
+  mutate(
+    Rho = basel_rho(PD),
+    # Vasicek: worst-case default rate with 99.9% confidence level
+    WCDR = pnorm((qnorm(PD) + sqrt(Rho) * qnorm(0.999)) / sqrt(1 - Rho))
+  )
+
+# Vasicek VaR computed at rating level
+test_summary <- test_port %>%
+  group_by(rating) %>%
+  summarise(Tot_EAD = sum(EAD), .groups = "drop") %>%
+  left_join(params, by = "rating") %>%
+  mutate(
+    VaR_Rating = Tot_EAD * WCDR * SEV,
+    EL_Rating  = Tot_EAD * PD * SEV
+  )
+
+VaR_Vasicek <- sum(test_summary$VaR_Rating)
+Capital_Vasicek <- VaR_Vasicek - EL_tot
+cat("VaR (Vasicek):", round(VaR_Vasicek / 1e6, 2), "million")
+cat("Capital (Vasicek, VaR - EL):", round(Capital_Vasicek / 1e6, 2), "million")
+```
+
+### Default probabilities: logit model vs rating agency grades
+
+The goal is to test whether raw financial variables (credit score, debt-to-income ratio and income) can predict default, using a logistic regression estimated on the training data and evaluated on the live portfolio.
+
+```{r irb-logit}
+train_logit <- train %>%
+  mutate(
+    score = (CreditScoreRangeLower + CreditScoreRangeUpper) / 2,
+    dti   = pmin(DebtToIncomeRatio, 1)   # capped at 1 (100%) to limit outliers
+  ) %>%
+  select(default12, score, dti, StatedMonthlyIncome) %>% drop_na()
+
+logit_model <- glm(default12 ~ score + dti + log1p(StatedMonthlyIncome),
+                   data = train_logit, family = binomial)
+
+# Evaluation on the test set
+test_logit <- test %>%
+  mutate(score = (CreditScoreRangeLower + CreditScoreRangeUpper) / 2,
+         dti = pmin(DebtToIncomeRatio, 1)) %>%
+  drop_na(score, dti, StatedMonthlyIncome)
+
+test_logit$PD_pred <- predict(logit_model, test_logit, type = "response")
+
+pd_pred_mean <- mean(test_logit$PD_pred) * 100
+pd_real_mean <- mean(test_logit$default12) * 100
+cat("Average predicted PD (%):", round(pd_pred_mean, 2))
+cat("Average observed default rate (%):", round(pd_real_mean, 2))
+```
+
+### Credit portfolio model: Monte Carlo with a systemic factor
+
+A one-factor Monte Carlo model simulates the portfolio loss. For each scenario of a Gaussian systemic factor `Z`, the PD of each rating class is conditioned on `Z` (inverse Vasicek formula) and the number of defaults is drawn from a binomial distribution.
+
+```{r irb-montecarlo}
+n_sim <- 10000
+Z <- rnorm(n_sim)   # 1 Gaussian systemic macroeconomic factor
+
+# Vectors for the simulation
+N_loans <- table(test_port$rating)
+EAD_unit <- test_summary$Tot_EAD / N_loans
+PD_vec <- params$PD
+Rho_vec <- params$Rho
+SEV_vec <- params$SEV
+
+simulated_loss <- numeric(n_sim)
+
+for (b in 1:length(rat)) {
+  if (rat[b] %in% names(N_loans)) {
+    # 1. PD conditioned on the state of the economy Z (inverse Vasicek formula)
+    PD_cond <- pnorm((qnorm(PD_vec[b]) - sqrt(Rho_vec[b]) * Z) / sqrt(1 - Rho_vec[b]))
+
+    # 2. Number of defaults from a binomial process
+    defaults_sim <- rbinom(n_sim, size = as.numeric(N_loans[rat[b]]), prob = PD_cond)
+
+    # 3. Update the total loss of each scenario
+    simulated_loss <- simulated_loss + (defaults_sim * EAD_unit[rat[b]] * SEV_vec[b])
+  }
+}
+
+VaR_MC <- quantile(simulated_loss, 0.999)
+cat("VaR (Monte Carlo, 99.9%):", round(VaR_MC / 1e6, 2), "million")
+cat("Difference VaR Vasicek - Monte Carlo at 99.9%:", round((VaR_Vasicek - VaR_MC) / 1e6, 2), "million")
+```
+
+```{r irb-histogram}
+hist(simulated_loss / 1e6, breaks = 50, col = "steelblue", border = "white",
+     main = "Simulated portfolio loss (one-factor model)",
+     xlab = "Loss (million)")
+abline(v = VaR_MC / 1e6, col = "red", lwd = 2)
+```
+
+### Conclusions
+
+This part shows how strongly the correlation hypothesis affects the result.
+
+- **The portfolio is very risky**: the average severity (LGD) of the defaulted loans is above 96%, so defaulters give back only about 4% of the exposure.
+- **From the binomial model to the Vasicek model**: ignoring the macroeconomic correlation suggests keeping an unexpected loss of less than 250 thousand dollars, a purely theoretical figure. Applying the Basel framework, that amount rises to 14.4 million dollars, almost 60 times more.
+- **The logit model works well as an internal scoring model**: the average predicted default probability on the live portfolio is 5.8% against an observed default rate of 5.79%.

@@ -1,0 +1,730 @@
+---
+title: "Credit Default Prediction: A Classification Model Benchmark"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+    html_preview: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  comment = "#>", fig.path = "figures/",
+  fig.width = 7, fig.height = 4.5, dpi = 120
+)
+
+# Set to FALSE to skip the Keras/TensorFlow network. That chunk needs a working
+# Python + TensorFlow installation; every other model uses standard R packages.
+run_keras <- TRUE
+```
+
+## Overview
+
+This project benchmarks several classification models on a single question: **will a credit applicant default (`Default = 1`)?**
+All models are trained on the same stratified training set and evaluated on the same test set with the same five metrics (Accuracy, Precision, Recall, F1 and AUC), so the results are directly comparable.
+
+Models covered: logistic regression, LDA, QDA, Naive Bayes, KNN (tuned by cross-validation), classification tree (full and pruned), bagging, random forest, boosting (untuned and tuned by cross-validation) and three neural networks (Keras, `nnet`, `neuralnet`). A regression tree on `Income` is also included to illustrate regression trees.
+
+> The figures quoted in the commentary were obtained with `set.seed(383)`. Models with a random component (random forest, boosting cross-validation, neural networks) may differ in the last decimals on a different machine or with different package versions.
+
+```{r packages}
+library(MASS)          # LDA and QDA
+library(class)         # KNN
+library(e1071)         # Naive Bayes
+library(rpart)         # Classification and regression trees
+library(rpart.plot)    # Tree plots
+library(randomForest)  # Bagging and random forest
+library(gbm)           # Boosting
+library(nnet)          # Neural network (1 hidden layer)
+library(neuralnet)     # Neural network (2 hidden layers)
+library(NeuralNetTools) # Plot of the nnet network
+library(pROC)          # ROC curves and AUC
+library(corrplot)      # Correlation plots
+library(caret)         # Cross-validation and tuning
+library(dplyr)
+
+set.seed(383)          # Reproducibility
+```
+
+## Data and cleaning
+
+The file contains 6,000 credit requests, 10 predictors and the binary target `Default`. The columns are renamed, then checked for missing and implausible values.
+
+```{r load-data}
+credit <- read.csv(file.path("data", "credit.csv"))
+
+names(credit) <- c("Default",
+                   "RevUtil",
+                   "Age",
+                   "Late30_59D",
+                   "DebtRatio",
+                   "Income",
+                   "Openlines",
+                   "Late90D",
+                   "RealEstate",
+                   "Late60_89D",
+                   "Dependents")
+str(credit)
+summary(credit)
+colSums(is.na(credit))   # missing values per column
+```
+
+**Which columns contain implausible values?**
+
+- `Income == 0`: a monthly income of zero is almost impossible for someone requesting a loan.
+- `RevUtil > 1`: it is a ratio (balance / credit limit), so values should lie between 0 and 1. Slightly above 1 is possible, values far above are errors.
+- `DebtRatio > 1`: it is the ratio (monthly debt / monthly income). Values thousands of times larger than 1 are not plausible.
+
+```{r implausible}
+mean(credit$Income == 0, na.rm = TRUE)   # share of Income == 0 (3.1%)
+mean(credit$DebtRatio > 100)             # share of DebtRatio > 100 (16.2%)
+mean(credit$DebtRatio > 1)               # share of DebtRatio > 1 (23.1%)
+```
+
+**Cleaning choices**
+
+- `Income == 0` is replaced with the median of the positive values. The number of zeros (3.1%) is too small to justify deleting those rows, and `Income` is one of the most important economic predictors, so the median is a reasonable compromise.
+- `RevUtil`, `DebtRatio` and `Income` are capped at their 99th percentile (upper tail only). For `RevUtil` only about 2% of the values are above 1, concentrated in the upper tail. For `DebtRatio` too many observations are above 100 to delete them, so capping only the extreme values is reasonable. For `Income`, a few very high values could bias the analysis.
+- `Default` becomes a factor (0 = no default, 1 = default), so that it can be treated as a class label by most of the models.
+
+```{r cleaning}
+valid_income  <- !is.na(credit$Income) & credit$Income > 0
+median_income <- median(credit$Income[valid_income])
+median_income                                    # 5,000
+credit$Income[!valid_income] <- median_income    # also covers NA values, if any
+
+# Winsorizing: cap the upper tail to get more homogeneous data
+cap_prob  <- 0.99
+cap_upper <- function(x, p = cap_prob) pmin(x, quantile(x, probs = p, na.rm = TRUE))
+credit$DebtRatio <- cap_upper(credit$DebtRatio)
+credit$RevUtil   <- cap_upper(credit$RevUtil)
+credit$Income    <- cap_upper(credit$Income)
+
+credit$Default <- factor(credit$Default, levels = c(0, 1))
+summary(credit)
+```
+
+## Exploratory analysis
+
+### Class balance
+
+```{r class-balance}
+table(credit$Default)
+round(prop.table(table(credit$Default)) * 100, 1)
+
+barplot(table(credit$Default), col = c("steelblue", "firebrick"),
+        names.arg = c("0 = No default", "1 = Default"),
+        main = "Class balance", ylab = "Number of requests")
+
+max(prop.table(table(credit$Default)))   # baseline accuracy
+```
+
+The dataset is highly imbalanced (5,599 non-defaulters vs 401 defaulters): a model that always predicts "No default" reaches an accuracy of about 93.3%. For this reason, besides accuracy, the benchmark also uses Recall and the ROC curve / AUC.
+
+### Predictors by default status
+
+```{r eda-boxplots}
+boxplot(Age ~ Default, data = credit, col = c("steelblue", "firebrick"),
+        main = "Age by default status", xlab = "Default", ylab = "Age")
+boxplot(RevUtil ~ Default, data = credit, col = c("steelblue", "firebrick"),
+        main = "Revolving utilization by default status",
+        xlab = "Default", ylab = "RevUtil")
+```
+
+The late-payment variables are almost always 0, so their means are compared instead of their distributions.
+
+```{r eda-late}
+mean_late <- aggregate(cbind(Late30_59D, Late60_89D, Late90D) ~ Default,
+                       data = credit, FUN = mean)
+barplot(as.matrix(mean_late[, -1]), beside = TRUE,
+        col = c("steelblue", "firebrick"),
+        main = "Average number of late payments",
+        legend.text = c("No default", "Default"),
+        args.legend = list(x = "topright"))
+```
+
+Defaulters tend to be younger (mean age 45 vs 53), use their revolving lines more heavily (mean `RevUtil` 0.69 vs 0.30) and have a much higher average number of late payments (30-59 days: 0.90 vs 0.20; 60-89 days: 0.39 vs 0.04; 90+ days: 0.65 vs 0.05).
+
+### Correlation matrix
+
+```{r correlation, fig.width=8, fig.height=8}
+credit_num <- credit
+credit_num$Default <- as.numeric(as.character(credit$Default))
+
+cor_matrix <- cor(credit_num, method = "pearson")
+corrplot(cor_matrix, method = "color",
+         addCoef.col = "black", number.cex = 0.5, tl.col = "black")
+```
+
+The correlations with the target are modest: `Late90D` (0.29), `RevUtil` (0.28), `Late60_89D` (0.28) and `Late30_59D` (0.26) are positive, and `Age` is negative (-0.13). This is intuitive, since late payments are a consequence of financial stress. The strongest correlation between two predictors is `Openlines` vs `RealEstate` (0.44), followed by `RealEstate` vs `Income` (0.34). The three late-payment variables are only moderately correlated with each other (0.20-0.30), so multicollinearity is not a serious problem here.
+
+## Train/test split and preprocessing
+
+The split is stratified: 70% of the observations of each class are sampled, so the default rate is approximately the same in the training and test sets.
+
+```{r split}
+index_0 <- which(credit$Default == 0)
+index_1 <- which(credit$Default == 1)
+train_0 <- sample(index_0, floor(length(index_0) * 0.7))
+train_1 <- sample(index_1, floor(length(index_1) * 0.7))
+index_train <- c(train_0, train_1)   # all training indices together
+
+train <- credit[index_train, ]
+test  <- credit[-index_train, ]
+```
+
+KNN and the neural networks need scaled predictors. The test set is scaled with the mean and standard deviation of the training set, to avoid using test information.
+
+```{r scaling}
+predictors   <- setdiff(names(credit), "Default")
+train_scaled <- scale(train[, predictors])
+test_scaled  <- scale(test[, predictors],
+                      center = attr(train_scaled, "scaled:center"),
+                      scale  = attr(train_scaled, "scaled:scale"))
+```
+
+## Evaluation framework
+
+A single function evaluates every model. It turns the predicted probabilities of default into classes with a threshold (0.5 by default) and computes, on the test set:
+
+- **Accuracy**: share of correct predictions.
+- **Precision**: share of predicted defaulters that really default.
+- **Recall**: share of real defaulters that are detected.
+- **F1**: harmonic mean of precision and recall.
+- **AUC**: area under the ROC curve. It measures how well the model ranks defaulters above non-defaulters, whatever the threshold.
+
+The predicted probabilities of every model are stored in the list `prob` for the final comparison.
+
+```{r evaluation-functions}
+y_test <- as.numeric(as.character(test$Default))   # 0/1 numeric
+
+evaluate <- function(p, threshold = 0.5) {
+  pred_class <- ifelse(p >= threshold, 1, 0)
+  TP <- sum(pred_class == 1 & y_test == 1)   # defaulters correctly detected
+  FP <- sum(pred_class == 1 & y_test == 0)   # false alarms
+  FN <- sum(pred_class == 0 & y_test == 1)   # missed defaults
+  TN <- sum(pred_class == 0 & y_test == 0)   # non-defaulters correctly classified
+
+  accuracy  <- (TN + TP) / length(y_test)
+  precision <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+  recall    <- ifelse(TP + FN == 0, 0, TP / (TP + FN))
+  f1        <- ifelse(precision + recall == 0, 0,
+                      2 * precision * recall / (precision + recall))
+  auc_val   <- as.numeric(auc(roc(y_test, p, levels = c(0, 1),
+                                  direction = "<", quiet = TRUE)))
+  round(c(Accuracy = accuracy, Precision = precision, Recall = recall,
+          F1 = f1, AUC = auc_val), 3)
+}
+
+# Confusion matrix from predicted probabilities
+conf_mat <- function(p, threshold = 0.5) {
+  table(Predicted = factor(ifelse(p >= threshold, 1, 0), levels = c(0, 1)),
+        Actual    = y_test)
+}
+
+prob <- list()   # predicted probabilities of every model
+```
+
+## Logistic regression
+
+```{r logistic}
+log_reg <- glm(Default ~ ., data = train, family = "binomial")
+summary(log_reg)
+
+log_reg_pred <- predict(log_reg, newdata = test, type = "response")
+summary(log_reg_pred)
+conf_mat(log_reg_pred)
+
+prob$Logistic <- log_reg_pred
+evaluate(prob$Logistic)
+```
+
+The model fits `Default` on all the predictors, estimates the probability of default of each test request and classifies it as default when the probability is at least 0.5. Results on the test set: Accuracy 0.938, Precision 0.656, Recall 0.174, F1 0.275, AUC 0.834. The model is very precise (21 of the 32 requests flagged are real defaults) but it detects only 21 of the 121 real defaulters, because few requests reach a probability of 0.5 when only 6.7% of the customers default.
+
+The coefficients are converted into odds ratios to interpret the effect of each variable:
+
+```{r logistic-odds}
+# Percentage change of the odds for a one-unit increase of each predictor
+odds_change <- round((exp(coef(log_reg)) - 1) * 100, 2)
+sort(odds_change, decreasing = TRUE)
+odds_change[c("Late30_59D", "Late60_89D", "Late90D", "Age", "DebtRatio", "Income")]
+
+# Income is measured in currency units, so the effect of one unit is tiny:
+# look at it per 1,000 units
+(exp(1000 * coef(log_reg)["Income"]) - 1) * 100
+```
+
+Interpretation, holding the other variables constant:
+
+- `Late30_59D`: each additional late payment of 30-59 days increases the odds of default by about 41%.
+- `Late60_89D`: each additional late payment of 60-89 days increases the odds by about 103%, i.e. the odds roughly double.
+- `Late90D`: each additional late payment of 90+ days increases the odds by about 70% (they are multiplied by 1.70).
+- `Age`: each additional year decreases the odds by about 2%. Over ten years the effect compounds: 0.980^10 = 0.82, i.e. about -18% on the odds.
+- `DebtRatio`: each additional unit changes the odds by only -0.02%. The coefficient is statistically significant (p = 0.04) but practically negligible.
+- `Income`: 1,000 additional currency units of income decrease the odds by about 6%.
+- `RevUtil`: going from 0 to 1 (a fully used account) multiplies the odds by about 10, the largest effect among the predictors.
+
+## Linear discriminant analysis (LDA)
+
+LDA assumes Gaussian predictors and the same covariance matrix in all classes.
+
+```{r lda}
+lda_model <- lda(Default ~ ., data = train)
+lda_model
+plot(lda_model)
+
+lda_pred <- predict(lda_model, test)
+lda_tab  <- table(Predicted = lda_pred$class, Actual = test$Default)
+lda_tab
+prob$LDA <- lda_pred$posterior[, "1"]
+evaluate(prob$LDA)
+```
+
+Here the assumptions are not very realistic. For example, among defaulters the late-payment variables are much more variable than among good payers (who almost always have 0 late payments):
+
+```{r lda-sd}
+sd_class <- sapply(split(train[, predictors], train$Default),
+                   function(d) apply(d, 2, sd))
+colnames(sd_class) <- c("sd No default", "sd Default")
+round(sd_class, 2)
+```
+
+For the three late-payment variables the standard deviation among defaulters is 2-3 times larger than among reliable payers (about 2.0 times for `Late30_59D`, 2.9 for `Late60_89D` and 3.2 for `Late90D`), so the covariance matrices are not the same in the two classes.
+
+Results on the test set: Accuracy 0.929, Precision 0.460, Recall 0.331, F1 0.385, AUC 0.843. Even if the assumptions are violated, LDA has the highest AUC of all the models and a higher recall than the logistic regression.
+
+## Quadratic discriminant analysis (QDA)
+
+QDA assumes that each class has its own covariance matrix.
+
+```{r qda}
+qda_model <- qda(Default ~ ., data = train)
+qda_model
+qda_pred <- predict(qda_model, test)
+qda_tab  <- table(Predicted = qda_pred$class, Actual = test$Default)
+qda_tab
+prob$QDA <- qda_pred$posterior[, "1"]
+evaluate(prob$QDA)
+
+# Comparison with LDA
+rbind(LDA = evaluate(prob$LDA), QDA = evaluate(prob$QDA))
+```
+
+Results on the test set: Accuracy 0.904, Precision 0.333, Recall 0.421, F1 0.372, AUC 0.835.
+
+QDA has a higher recall than LDA (0.421 vs 0.331): allowing a different covariance matrix per class lets it detect more defaulters, at the cost of a lower precision (0.333 vs 0.460). Its AUC is lower (0.835 vs 0.843), so it does not rank customers better: the higher recall comes mainly from a different calibration of the probabilities at the 0.5 threshold rather than from better discrimination.
+
+## Naive Bayes
+
+The model assumes that the predictors are conditionally independent given the class. The correlations among the late-payment variables show how reasonable this is:
+
+```{r naive-bayes}
+cor(train[train$Default == 0, c("Late30_59D", "Late60_89D", "Late90D")])
+cor(train[train$Default == 1, c("Late30_59D", "Late60_89D", "Late90D")])
+
+nb_model <- naiveBayes(Default ~ ., data = train)
+nb_prob  <- predict(nb_model, test, type = "raw")     # posterior probabilities
+nb_pred  <- predict(nb_model, test, type = "class")   # predicted classes
+nb_tab   <- table(Predicted = nb_pred, Actual = test$Default)
+nb_tab
+prob$NaiveBayes <- nb_prob[, "1"]
+evaluate(prob$NaiveBayes)
+```
+
+The independence assumption is not very plausible. The three late-payment variables measure related behaviour: a client who pays 30-59 days late is more likely to also have later delays. Indeed, the correlations are positive within each class (0.14-0.28 among good payers, 0.08-0.19 among defaulters), although weak. The model therefore partly "counts" the same information several times, which tends to make the posterior probabilities overconfident.
+
+Results on the test set: Accuracy 0.907, Precision 0.350, Recall 0.455, F1 0.396, AUC 0.835. The model has the highest recall of all the non-tree models (and the highest F1) but a low precision.
+
+## K-nearest neighbours (KNN)
+
+KNN classifies a request using the defaults of its K nearest customers, so the predictors must be on the same scale (the scaled data are used). K is chosen with 5-fold cross-validation on the training set, using the AUC as the metric.
+
+```{r knn}
+y_train <- factor(train$Default, levels = c(1, 0),
+                  labels = c("Default", "NoDefault"))
+
+control <- trainControl(method = "cv", number = 5,
+                        classProbs = TRUE, summaryFunction = twoClassSummary)
+
+knn_model <- caret::train(x = train_scaled, y = y_train,
+                          method = "knn",
+                          trControl = control,
+                          tuneLength = 10,
+                          metric = "ROC")
+knn_model$bestTune   # K = 23
+plot(knn_model)      # cross-validated AUC vs K
+
+knn_pred <- predict(knn_model, newdata = test_scaled, type = "prob")[, "Default"]
+conf_mat(knn_pred)
+
+prob$KNN <- knn_pred
+evaluate(prob$KNN)
+```
+
+The class imbalance is also evident in the confusion matrix: with the selected K = 23, the estimated probability of default rarely exceeds 0.5, because more than half of the neighbours must be defaulters (only 37 of the 1,801 test requests are classified as defaults). Therefore, with the standard threshold, recall is low (0.19), even though the ability to rank customers is acceptable (AUC 0.819).
+
+The signal in these data is rather "smooth" (almost monotonic in the late-payment variables and `RevUtil`), so a large K is advisable. K = 23 is the largest value in the grid and the cross-validated AUC is still increasing (0.750 for K = 5, 0.821 for K = 23), so a wider grid with even larger values of K could be tested.
+
+Results on the test set: Accuracy 0.938, Precision 0.622, Recall 0.190, F1 0.291, AUC 0.819.
+
+## Classification tree
+
+First a big tree is grown with a low complexity parameter (`cp`); it is pruned in the next section.
+
+```{r tree, fig.width=10, fig.height=6}
+tree_model <- rpart(Default ~ .,
+                    data = train,
+                    method = "class",
+                    parms = list(prior = c(0.5, 0.5)),
+                    control = rpart.control(cp = 0.001, xval = 10))
+
+printcp(tree_model)
+plotcp(tree_model)
+rpart.plot(tree_model)
+
+# Probabilities on the test set for the full tree
+tree_pred <- predict(tree_model, test, type = "prob")[, "1"]
+prob$Tree <- tree_pred
+
+# Confusion matrix and evaluation
+table(Predicted = predict(tree_model, test, type = "class"), Actual = test$Default)
+evaluate(prob$Tree)
+```
+
+The code grows a deep tree (cp = 0.001 extrapolate all the informations) with 10-fold cross-validation of the error.
+Results on the test set: Accuracy 0.811, Precision 0.175, Recall 0.488, F1 0.258, AUC 0.621. The tree is too complex (105 terminal nodes) and overfits the training data: the cross-validation error is lowest with 3 splits (0.488) and then increases (0.541 with 104 splits).
+
+## Pruning
+
+The complexity parameter that minimises the cross-validation error is selected automatically and the big tree is pruned to evaluate a better model.
+
+```{r pruning}
+cp_min <- tree_model$cptable[which.min(tree_model$cptable[, "xerror"]), "CP"]
+
+pruned_tree <- prune(tree_model, cp = cp_min)
+rpart.plot(pruned_tree, extra = 104)
+
+pruned_tree_pred <- predict(pruned_tree, test, type = "class")
+table(Predicted = pruned_tree_pred, Actual = test$Default)
+prob$PrunedTree <- predict(pruned_tree, test, type = "prob")[, "1"]
+
+evaluate(prob$PrunedTree)
+```
+
+The pruned tree has only 3 splits and 4 terminal nodes. Results on the test set: 
+    
+    Accuracy 0.695, Precision 0.146, Recall 0.727, F1 0.243, AUC 0.743.
+
+Compared with the big tree, the total accuracy is lower, but recall (0.727 vs 0.488) and AUC (0.743 vs 0.621) go up. This technique recognises about 73% of the defaulters, at the cost of more false alarms (516 vs 278), so precision and F1 are slightly lower.
+
+The pruned tree keeps only the most relevant variables and discards the noisy ones: only `RevUtil` and `Late30_59D` are used.
+
+- 'RevUtil' is the most powerful predictor. It measures how much of the available credit has already been used and is the first symptom of financial stress. The first split (the root) is on this variable.
+- `Late30_59D` (at least one late payment of 30-59 days) is the second variable. `Late60_89D`, `Late90D`, `Age`, `DebtRatio`, `Income` and the other predictors are not used.
+
+How the tree works:
+
+- **Root**: if `RevUtil` < 48% the client goes to the left branch ("low risk"), otherwise to the right branch ("high risk").
+- **Right branch** (`RevUtil` >= 48%): 29% of the training clients, classified as "Default". About 17% of them really default (206 of 1,202), but they include 74% of all the defaulters in the training set. The probability printed by the tree (74%) is computed with the 50/50 prior, so it is higher than the real share of defaulters.
+- **Left branch** (`RevUtil` < 48%): the model looks at late payments.
+    - No late payment of 30-59 days: the client is classified as "No default". This is the largest group, 63% of the training clients, with a 82% probability of being in this category under the 50/50 prior (in the data 98.5% of these clients do not default).
+    - At least one late payment of 30-59 days (8% of the training clients): the tree splits again. If `RevUtil` < 11% the client is classified as a good client (37% probability of default under the 50/50 prior), otherwise as a "bad client" (70% probability of default).
+
+## Regression tree
+
+A regression tree needs a continuous target, so here the tree predicts `Income` instead of `Default`. This section is purely illustrative.
+
+```{r regression-tree}
+reg_tree_model <- rpart(Income ~ .,
+                        data = train,
+                        method = "anova")
+reg_tree_model
+rpart.plot(reg_tree_model)
+
+reg_pred <- predict(reg_tree_model, test)
+
+caret::RMSE(reg_pred, test$Income)
+plot(test$Income, reg_pred,
+     main = "Regression Tree: Actual vs Predicted Income",
+     xlab = "Actual Income",
+     ylab = "Predicted Income",
+     pch = 16, col = rgb(0.2, 0.4, 0.8, 0.5))
+abline(0, 1, col = "red", lwd = 2)   # ideal line of perfect prediction
+```
+
+The tree (`method = "anova"`) splits the clients into groups with similar income, predicts for each test client the mean income of its group and measures the error with the RMSE. It has 9 terminal nodes and uses only `RealEstate`, `Age` and `DebtRatio`. The RMSE is about 3,631 currency units, only slightly lower than the standard deviation of `Income` in the test set (4,272): the model improves on the simple mean by about 15%. Explaining a person's income with these variables is really difficult: the plot shows that the predictions take only 9 different values and are far from the red line.
+
+## Bagging
+
+Bagging is a random forest in which all the predictors are considered at every split (`mtry` = number of predictors).
+
+```{r bagging}
+p <- ncol(train) - 1   # number of predictors
+
+bagging_model <- randomForest(Default ~ .,
+                              data = train,
+                              mtry = p,
+                              ntree = 500)
+
+bagging_pred_class <- predict(bagging_model, test, type = "class")
+table(Predicted = bagging_pred_class, Actual = test$Default)
+bagging_prob <- predict(bagging_model, test, type = "prob")[, "1"]
+prob$Bagging <- bagging_prob
+evaluate(prob$Bagging)
+
+plot(bagging_model, main = "Bagging: Error Rate vs Trees")
+```
+
+Bagging grows 500 trees, each one on a different bootstrap sample of the training data, and averages their votes. The averaging reduces the variance of a single tree. The plot shows how the error rates (overall and by class) change with the number of trees.
+
+Results on the test set: Accuracy 0.924, Precision 0.379, Recall 0.207, F1 0.267, AUC 0.803, a good AUC compared with the single trees.
+
+## Random forest
+
+In a random forest, `mtry` is typically the square root of the number of predictors.
+
+```{r random-forest}
+p_randomForest <- floor(sqrt(p))
+
+randomForest_model <- randomForest(Default ~ .,
+                                   data = train,
+                                   mtry = p_randomForest,
+                                   ntree = 500,
+                                   importance = TRUE)
+
+randomForest_pred_class <- predict(randomForest_model, test, type = "class")
+
+# Confusion matrix
+table(Predicted = randomForest_pred_class, Actual = test$Default)
+
+# Final evaluation
+randomForest_prob <- predict(randomForest_model, test, type = "prob")[, "1"]
+prob$RandomForest <- randomForest_prob
+evaluate(prob$RandomForest)
+plot(randomForest_model, main = "Random Forest: Error Rate vs Trees")
+```
+
+The random forest uses the same logic as bagging (500 trees on bootstrap samples), but at every split only 3 predictors, chosen at random, are considered. In this way the trees are less correlated with each other and the average of their predictions is more stable.
+
+Results on the test set: Accuracy 0.929, Precision 0.432, Recall 0.157, F1 0.230, AUC 0.807. The AUC is slightly better than bagging (0.807 vs 0.803), but the difference is tiny and the recall is lower.
+
+## Boosting
+
+`gbm` needs a 0/1 numeric target, so `Default` is converted back to numbers.
+
+```{r boosting}
+train_gbm <- train %>%
+  mutate(Default = as.numeric(as.character(Default)))
+
+test_gbm <- test %>%
+  mutate(Default = as.numeric(as.character(Default)))
+
+boosting_model <- gbm(Default ~ .,
+                      data = train_gbm,
+                      distribution = "bernoulli",
+                      interaction.depth = 2,
+                      shrinkage = 0.01,
+                      n.trees = 500)
+
+gbm_prob <- predict(boosting_model, test_gbm, n.trees = 500, type = "response")
+
+gbm_pred_class <- as.factor(ifelse(gbm_prob >= 0.5, 1, 0))
+
+table(Predicted = factor(gbm_pred_class, levels = c(0, 1)), Actual = test$Default)
+
+prob$Boosting <- gbm_prob
+evaluate(prob$Boosting)
+```
+
+The model builds 500 small trees (`interaction.depth = 2`, i.e. at most 2 splits per tree) one after the other: each new tree is fitted to the errors of the current ensemble, so the observations that are predicted badly receive more attention. The shrinkage of 0.01 reduces the contribution of each tree, so the model learns slowly and is less likely to overfit.
+
+Results on the test set: Accuracy 0.937, Precision 0.590, Recall 0.190, F1 0.288, AUC 0.832.
+
+## Neural networks
+
+Three neural networks are trained on the same standardised data and evaluated on the same test set. The predictors must be normalised because they are on very different scales (e.g. `Income` and `DebtRatio` have values in the thousands, while `RevUtil` is a ratio around 0-1).
+
+### Keras / TensorFlow
+
+```{r nn-keras, eval=run_keras}
+# Requires a working Python + TensorFlow installation
+library(tensorflow)
+library(reticulate)
+library(keras3)
+
+# Data preparation
+train_nn_x <- as.matrix(train[, predictors])
+test_nn_x  <- as.matrix(test[, predictors])
+
+train_nn_y <- as.numeric(as.character(train$Default))
+test_nn_y  <- as.numeric(as.character(test$Default))
+
+set.seed(383)
+shuffle_idx <- sample(nrow(train_nn_x))
+train_nn_x  <- train_nn_x[shuffle_idx, ]
+train_nn_y  <- train_nn_y[shuffle_idx]
+
+
+# Architecture
+norm_layer <- layer_normalization(axis = -1)
+norm_layer %>% adapt(train_nn_x)
+
+nn_model <- keras_model_sequential(input_shape = ncol(train_nn_x)) %>%
+  norm_layer() %>%
+  layer_dense(units = 5, activation = "relu") %>%
+  layer_dense(units = 3, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+nn_model %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.01),
+  loss      = "binary_crossentropy",
+  metrics   = c("accuracy")
+)
+
+train_nn_model <- nn_model %>% fit(
+  train_nn_x, train_nn_y,
+  epochs           = 50,
+  batch_size       = 32,
+  validation_split = 0.2,
+  verbose          = 0
+)
+
+plot(train_nn_model)
+
+# Evaluation
+keras_prob <- as.numeric(predict(nn_model, test_nn_x))
+prob$NeuralNet_Keras <- keras_prob
+
+keras_pred_class <- factor(ifelse(keras_prob >= 0.5, 1, 0), levels = c(0, 1))
+table(Predicted = keras_pred_class, Actual = test$Default)
+evaluate(prob$NeuralNet_Keras)
+```
+
+### nnet (1 hidden layer)
+
+```{r nn-nnet}
+train_scaled_df <- as.data.frame(train_scaled)
+test_scaled_df  <- as.data.frame(test_scaled)
+train_scaled_df$Default <- train$Default
+test_scaled_df$Default  <- test$Default
+
+set.seed(383)
+nn <- nnet(Default ~ ., data = train_scaled_df, size = 5, decay = 0.01,
+           maxit = 500, trace = FALSE)
+nnet_prob <- as.numeric(predict(nn, test_scaled_df, type = "raw"))
+prob$NeuralNet <- nnet_prob
+
+nnet_pred_class <- factor(ifelse(nnet_prob >= 0.5, 1, 0), levels = c(0, 1))
+table(Predicted = nnet_pred_class, Actual = test$Default)
+evaluate(prob$NeuralNet)
+
+plotnet(nn,
+        main = "Neural Network Structure (1 Hidden Layer)",
+        alpha = 0.6, circle_col = "white", pos_col = "black", neg_col = "red")
+```
+
+### neuralnet (2 hidden layers)
+
+```{r nn-neuralnet}
+# Data preparation
+train_nn_df <- as.data.frame(train_scaled)
+test_nn_df  <- as.data.frame(test_scaled)
+train_nn_df$Default <- as.numeric(as.character(train$Default))
+test_nn_df$Default  <- as.numeric(as.character(test$Default))
+
+# Dynamic formula
+variables_2      <- names(train_nn_df)
+predictors_multi <- variables_2[!variables_2 %in% "Default"]
+formula_nn       <- as.formula(paste("Default ~", paste(predictors_multi, collapse = " + ")))
+
+# Training
+nn_multi <- neuralnet(formula_nn,
+                      data = train_nn_df,
+                      hidden = c(5, 3),
+                      err.fct = "ce",
+                      linear.output = FALSE,
+                      stepmax = 1e6)
+
+# Evaluation
+# neuralnet::compute is called explicitly because dplyr also defines compute()
+nn_pred_obj <- neuralnet::compute(nn_multi, test_nn_df[, predictors_multi])
+prob$NeuralNet_Multi <- as.numeric(nn_pred_obj$net.result)
+
+nn_multi_pred_class <- factor(ifelse(prob$NeuralNet_Multi >= 0.5, 1, 0), levels = c(0, 1))
+table(Predicted = nn_multi_pred_class, Actual = test$Default)
+nn_multi_metrics <- evaluate(prob$NeuralNet_Multi)
+nn_multi_metrics
+
+plot(nn_multi, main = "Neural Network Structure (neuralnet - 2 Hidden Layers)")
+```
+
+### Architectures and results
+
+- **Keras/TensorFlow**: a normalization layer, a first hidden layer with 5 neurons and a second one with 3 neurons (both with ReLU activation) and an output neuron with a sigmoid activation. ReLU lets a neuron pass its weighted sum forward when it is positive and outputs 0 (the neuron is "switched off") when it is negative, so it works as a filter on the combinations of the client's data. The sigmoid in the last neuron gives an output that is always between 0 and 1, i.e. the probability of default. The network is trained for 50 epochs with the Adam optimizer and the binary cross-entropy loss, and 20% of the training rows are used to monitor the validation error.
+- **nnet**: one hidden layer with 5 neurons (logistic activation) and a weight decay of 0.01, which penalises large weights and limits overfitting.
+- **neuralnet**: two hidden layers (5 and 3 neurons, logistic activation), trained by minimising the cross-entropy error. The output passes through a logistic function, so it is a probability.
+
+Results on the test set:
+
+- Keras: recall and precision in the range of 20-26% and 47-51% respectively and AUC around 0.83-0.84 (the exact values change with the random initialisation of the weights).
+- nnet: Accuracy 0.931, Precision 0.472, Recall 0.207, F1 0.287, AUC 0.828.
+- neuralnet: see the output of the `neuralnet` chunk above (the values depend on the random initialisation of the weights).
+
+The Keras and nnet networks reach an accuracy of about 93%, the same as always predicting "no default": at the 0.5 threshold they detect only a minority of the defaulters. The strength of the networks is the AUC, which stays high (about 0.83): they rank the customers well even if the 0.5 threshold is too high to detect many defaulters. However, they do not improve on the logistic regression or LDA (AUC 0.834 and 0.843), so the extra complexity does not pay off here.
+
+## Boosting: hyperparameter tuning
+
+The number of trees is now chosen by 5-fold cross-validation: up to 2,000 trees are grown, each with at most 3 splits, with a shrinkage of 0.05.
+
+```{r boosting-cv}
+boosting_cv <- gbm(Default ~ .,
+                   data = train_gbm,
+                   distribution = "bernoulli",
+                   n.trees = 2000,
+                   interaction.depth = 3,
+                   shrinkage = 0.05,
+                   cv.folds = 5)
+
+# Optimal number of trees according to the cross-validation error
+optimum_ntrees_gbm <- which.min(boosting_cv$cv.error)
+optimum_ntrees_gbm
+
+# Error curves (green = CV error, black = training error)
+gbm.perf(boosting_cv, method = "cv")
+```
+
+```{r boosting-cv-plot}
+# Clearer plot of the CV error
+plot(boosting_cv$cv.error, type = "l", col = "blue", lwd = 2,
+     main = "GBM Cross-Validation Error", xlab = "Number of Trees", ylab = "CV Error")
+abline(v = optimum_ntrees_gbm, col = "red", lty = 2, lwd = 2)
+```
+
+```{r boosting-cv-eval}
+# Prediction, evaluation and confusion matrix
+boosting_cv_prob <- predict(boosting_cv, test_gbm, n.trees = optimum_ntrees_gbm, type = "response")
+prob$Boosting_CV <- boosting_cv_prob
+
+boosting_cv_pred <- factor(ifelse(boosting_cv_prob >= 0.5, 1, 0), levels = c(0, 1))
+table(Predicted = boosting_cv_pred, Actual = test$Default)
+
+evaluate(prob$Boosting_CV)
+```
+
+The small shrinkage keeps the model learning "slowly", which usually gives better results. The CV error drops quickly during the first 100 trees and reaches its minimum at almost 118 trees; after that it goes up, as the model starts to overfit the training data instead of learning useful patterns.
+
+Results on the test set (with the optimal number of trees): Accuracy 0.933, Precision 0.510, Recall 0.207, F1 0.294, AUC 0.827. The accuracy is about 93% like most of the other models; the recall is only about 20% with a precision of about 50%, but the AUC is high (about 0.83). In this run the tuned model has almost the same AUC as the untuned boosting model (0.832): tuning the number of trees does not improve the ranking ability here.
+
+## Head-to-head comparison
+
+The same evaluation is applied to the probabilities stored for every model; the table is sorted by decreasing AUC.
+
+```{r comparison}
+results <- as.data.frame(t(sapply(prob, evaluate)))
+knitr::kable(results[order(-results$AUC), ], digits = 3)
+```
+
+- Overall, the AUC of most models lies between 0.80 and 0.84. **LDA is the best (0.843)**, followed by QDA, Naive Bayes, logistic regression, boosting and the neural networks (0.83-0.84), while the pruned tree (0.743) and the big tree (0.621) are clearly worse.
+- Among the ensemble methods, **boosting is the best** (AUC 0.832, against 0.807 for the random forest and 0.803 for bagging), in line with its reputation as one of the most powerful and reliable methods.
+- The models with the highest recall at the 0.5 threshold (pruned tree, Naive Bayes, big tree, QDA) pay for it with a low precision, so the choice of the model also depends on the cost of a missed default compared with the cost of a false alarm.
